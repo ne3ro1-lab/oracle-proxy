@@ -51,6 +51,53 @@ app.get('/api/verify-payment', async (req, res) => {
   }
 });
 
+// メールアドレスから、Stripe上に有効な契約（サブスクリプション）があるか確認する
+// 別の端末で購入した人が、新しい端末でプレミアムを復元するために使う
+app.get('/api/check-subscription', async (req, res) => {
+  try {
+    const email = (req.query.email || '').trim();
+    if (!email) {
+      return res.status(400).json({ valid: false, error: 'メールアドレスが指定されていません。' });
+    }
+    if (!STRIPE_SECRET_KEY) {
+      return res.status(500).json({ valid: false, error: 'サーバー側でSTRIPE_SECRET_KEYが設定されていません。' });
+    }
+
+    // ① メールアドレスからStripeの顧客を検索する
+    const custResp = await fetch(
+      `https://api.stripe.com/v1/customers?email=${encodeURIComponent(email)}&limit=5`,
+      { headers: { 'Authorization': 'Bearer ' + STRIPE_SECRET_KEY } }
+    );
+    const custData = await custResp.json();
+    if (!custResp.ok) {
+      return res.status(custResp.status).json({ valid: false, error: custData.error?.message || '顧客情報の取得でエラーが発生しました。' });
+    }
+
+    const customers = custData.data || [];
+    if (customers.length === 0) {
+      return res.json({ valid: false, error: 'このメールアドレスでのご契約が見つかりませんでした。' });
+    }
+
+    // ② 見つかった顧客ごとに、有効なサブスクリプション（プレミアムプラン）があるか確認する
+    for (const customer of customers) {
+      const subResp = await fetch(
+        `https://api.stripe.com/v1/subscriptions?customer=${encodeURIComponent(customer.id)}&status=active&limit=1`,
+        { headers: { 'Authorization': 'Bearer ' + STRIPE_SECRET_KEY } }
+      );
+      const subData = await subResp.json();
+      if (subResp.ok && subData.data && subData.data.length > 0) {
+        return res.json({ valid: true });
+      }
+    }
+
+    res.json({ valid: false, error: '有効なプレミアムプランのご契約が見つかりませんでした。' });
+
+  } catch (err) {
+    console.error('サブスク確認エラー:', err);
+    res.status(500).json({ valid: false, error: err.message });
+  }
+});
+
 // フロントエンドの fetchWithTimeout('/.netlify/functions/oracle', ...) の
 // リクエストボディ（{model, max_tokens, messages}）をそのまま Claude API に転送する
 app.post('/api/oracle', async (req, res) => {
