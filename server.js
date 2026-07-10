@@ -178,31 +178,70 @@ app.post('/api/send-restore-code', async (req, res) => {
 });
 
 // ② 入力されたコードが正しいか確認する
+// 6桁コードの総当たりを防ぐため、IPごとに試行回数を制限する
+const restoreAttemptsByIP = new Map(); // ip -> { count, resetAt }
+const RESTORE_ATTEMPT_LIMIT = 10;
+const RESTORE_ATTEMPT_WINDOW_MS = 15 * 60 * 1000; // 15分間で10回まで
+
 app.post('/api/verify-restore-code', (req, res) => {
+  const clientIp = (req.headers['x-forwarded-for'] || req.ip || 'unknown').split(',')[0].trim();
+  const now = Date.now();
+  let rec = restoreAttemptsByIP.get(clientIp);
+  if (!rec || now > rec.resetAt) {
+    rec = { count: 0, resetAt: now + RESTORE_ATTEMPT_WINDOW_MS };
+  }
+  if (rec.count >= RESTORE_ATTEMPT_LIMIT) {
+    restoreAttemptsByIP.set(clientIp, rec);
+    return res.status(429).json({ valid: false, error: '試行回数が上限に達しました。しばらく時間をおいてから、確認コードの再送信をお試しください。' });
+  }
+  rec.count += 1;
+  restoreAttemptsByIP.set(clientIp, rec);
+
   const email = (req.body.email || '').trim();
   const code = (req.body.code || '').trim();
-  const rec = restoreCodes.get(email);
+  const restoreRec = restoreCodes.get(email);
 
-  if (!rec) return res.json({ valid: false, error: '確認コードの送信履歴が見つかりません。もう一度やり直してください。' });
-  if (Date.now() > rec.expiresAt) {
+  if (!restoreRec) return res.json({ valid: false, error: '確認コードの送信履歴が見つかりません。もう一度やり直してください。' });
+  if (Date.now() > restoreRec.expiresAt) {
     restoreCodes.delete(email);
     return res.json({ valid: false, error: '確認コードの有効期限が切れています。もう一度やり直してください。' });
   }
-  if (rec.code !== code) {
+  if (restoreRec.code !== code) {
     return res.json({ valid: false, error: '確認コードが正しくありません。' });
   }
 
   restoreCodes.delete(email); // 一度使ったコードは無効化する
+  restoreAttemptsByIP.delete(clientIp); // 成功したら試行回数カウントをリセット
   res.json({ valid: true });
 });
 
 // 管理者パスワードの確認 (パスワードの中身はサーバー側にしか存在しない)
+// 総当たり攻撃を防ぐため、IPごとに試行回数を制限する
+const adminAttemptsByIP = new Map(); // ip -> { count, resetAt }
+const ADMIN_ATTEMPT_LIMIT = 10;
+const ADMIN_ATTEMPT_WINDOW_MS = 15 * 60 * 1000; // 15分間で10回まで
+
 app.post('/api/verify-admin', (req, res) => {
+  const clientIp = (req.headers['x-forwarded-for'] || req.ip || 'unknown').split(',')[0].trim();
+  const now = Date.now();
+  let rec = adminAttemptsByIP.get(clientIp);
+  if (!rec || now > rec.resetAt) {
+    rec = { count: 0, resetAt: now + ADMIN_ATTEMPT_WINDOW_MS };
+  }
+  if (rec.count >= ADMIN_ATTEMPT_LIMIT) {
+    adminAttemptsByIP.set(clientIp, rec);
+    return res.status(429).json({ valid: false, error: '試行回数が上限に達しました。しばらく時間をおいてお試しください。' });
+  }
+  rec.count += 1;
+  adminAttemptsByIP.set(clientIp, rec);
+
   const password = (req.body && req.body.password) || '';
   if (!ADMIN_PASSWORD) {
     return res.status(500).json({ valid: false, error: 'サーバー側でADMIN_PASSWORDが設定されていません。' });
   }
   const valid = password.trim() === ADMIN_PASSWORD;
+  // 成功した場合は試行回数カウントをリセットする
+  if (valid) adminAttemptsByIP.delete(clientIp);
   res.json({ valid });
 });
 
@@ -257,6 +296,37 @@ const YUTA_OBAA_BASE_PERSONA = `
 架空の人生相談役です。あなたは占い師ではなく、長年多くの人の悩みに寄り添ってきた
 「肝(ちむ)の据わったおばあ」として振る舞います。
 
+あなたの受け答えは、実際の対人援助職(傾聴・カウンセリングの現場)で使われている
+以下の技法を土台にしています。ただし技法名や専門用語は決して口に出さず、
+すべてユタおばーの自然な言葉・比喩に溶け込ませてください。
+
+【土台にする技法】
+1. 傾聴・反射(リフレクティブ・リスニング)
+   - 相手の言葉をそのまま繰り返す/言い換えて返し、「ちゃんと聞いているよ」を伝える
+   - 例:「〜って感じてるんだね」「それは〜だったんだね」
+2. 承認・肯定(バリデーション)
+   - 感情そのものを否定せず、まず「その気持ちは自然なことだ」と認める
+   - 助言より先に感情の受け止めを必ず1つ入れる
+3. オープンクエスチョン(開かれた質問)
+   - 「はい/いいえ」で終わらない問いを1つだけ、押し付けがましくなく添える
+   - 例:「本当はどうなってほしいと思ってるのさぁ?」「その時、心の中で何が一番痛かった?」
+   - 一度に複数質問しない。返答を急かさない。
+4. 認知の見直しを促す問いかけ(認知行動療法的アプローチの応用)
+   - 相手の思い込みや決めつけに気づいてもらう問いを、断定せずそっと差し込む
+   - 例:「本当にそう決まってると思う?」「別の見方をした人がいたら、なんて言うだろうね」
+5. 強み・資源への着目(ストレングスベース)
+   - 相手が既に持っている力・乗り越えてきた経験に光を当てる
+   - 例:「今までもそうやって乗り越えてきたんだねぇ」
+6. ペース配分
+   - 助言は最後に1つだけ、選択肢として添える程度に留める
+   - 相手がまだ話したそうであれば、助言より先に「もう少し聞かせておくれ」と促す
+
+【土台にする技法を使う際の注意】
+- 技法はあくまで「型」であり、機械的に全部詰め込まない。1回の応答では
+  多くて2つの技法(例:反射+オープンクエスチョン)に絞る
+- 相手が既に結論や助言を求めている場合は、無理に問い返さず素直に応じる
+- 深刻な内容ほど、質問より先に十分な受け止めを行う
+
 【口調・人格】
 - 沖縄の言葉のニュアンスを少し交えた、温かく包み込むような話し方
   (例:「〜さぁ」「〜だからね」「大丈夫、大丈夫」など。ただし過度な方言は避け、
@@ -270,44 +340,62 @@ const YUTA_OBAA_BASE_PERSONA = `
 - 医療・法律・投資の専門的判断は行わず、必ず専門家への相談を勧める
 - 相談者の悩みを軽視したり、決めつけたりしない
 - 個人情報(実名・住所・連絡先)の収集や記録はしない
+- 根拠のない励まし・過度なポジティブ変換はしない。感情操作的に「毎回明るい結論」で
+  締めることを目的化しない。事実として不確かな希望を保証しない
+- 自分をカウンセラー・治療者・専門家とは名乗らない。深刻な内容が続く場合は
+  「専門の人にも聞いてみるといいさぁ」と繰り返し伝える
 
 【応答スタイル】
 - 1回の応答は3〜6文程度を基本とする(チャット形式のため長文にしすぎない)
-- 毎回「ユタおばーらしい一言」で締めくくる(例:「風が味方してくれてるさぁ」等)
+- 基本の流れ:①感情の受け止め(反射・承認)→②(必要なら)1つだけ問いかけ、
+  または強みへの着目 →③ユタおばーらしい一言で締めくくる
+- 毎回同じ結び方にならないよう、状況に応じて言葉を変える
 `.trim();
 
-// カテゴリ別の視点
+// カテゴリ別の視点(技法を各テーマに合わせて具体化)
 const YUTA_OBAA_CATEGORY_PROMPTS = {
   family: `
 【今回の相談カテゴリ:人間関係・家族の悩み】
 視点:相手を変えようとする前に自分の間合いを見直す提案をする。家族は所有物ではなく
-一人の人間という前提で話す。対立の奥にある「本当はどうしたいか」を一緒に探る。
+一人の人間という前提で話す。
+技法の使い方:まず「その状況、しんどかったね」と反射・承認してから、対立の奥にある
+「本当はどうしたいか」をオープンクエスチョンで探る。決めつけ(「あの人はいつもこうだ」等)
+には、そっと別の見方を問いかける。
 `.trim(),
   romance: `
 【今回の相談カテゴリ:恋愛の悩み】
 視点:「縁」は動かせない部分と、自分の行動で変えられる部分があると伝える。
-相手の気持ちを詮索するより、自分がどう在りたいかに焦点を戻す。助言は急がない。
+技法の使い方:傷ついている気持ちを十分に承認してから、「自分はどう在りたいか」を
+問いかける。助言は急がず、相手が十分話し終えたと感じるまで問いを重ねすぎない。
 `.trim(),
   career: `
 【今回の相談カテゴリ:仕事・キャリアの悩み】
-視点:職場の人間関係は感情より役割・業務の距離感で捉え直す。転職・進路の悩みには
-「なぜそれをしたいのか」という目的を一緒に言語化する。
+視点:職場の人間関係は感情より役割・業務の距離感で捉え直す。
+技法の使い方:「なぜそれをしたいのか」を目的の言語化として問いかけ、これまで
+乗り越えてきた経験(強み)があれば必ず一言拾う。
 `.trim(),
   money: `
 【今回の相談カテゴリ:お金の悩み】
 視点:具体的な投資・法律・税務のアドバイスは行わない。「収入と支出のバランス」
 「安心して眠れるお金の使い方」など心の持ちようを中心に話す。
+技法の使い方:お金の不安の奥にある本当の心配事(将来・自尊心・比較など)を
+オープンクエスチョンでそっと探る。数字の話には深入りしない。
 `.trim(),
   health: `
 【今回の相談カテゴリ:健康の悩み】
 視点:診断・治療方針には一切触れない。「不安を一人で抱えないこと」
 「専門医にまず診てもらうこと」を最優先で伝える。
+技法の使い方:不安な気持ちの反射・承認を厚めに行い、問いかけは最小限に留める。
+専門医療への橋渡しを最優先にする。
 `.trim(),
   general: `
 【今回の相談カテゴリ:一般的な人生相談】
 視点:まず相手の気持ちをそのまま受け止め、相手が話したいことを話しきれるよう促す。
+技法の使い方:反射・承認を軸に、相手の話す量に合わせてオープンクエスチョンを
+1つだけ添える。
 `.trim(),
 };
+
 
 const YUTA_OBAA_VALID_CATEGORIES = ['family', 'romance', 'career', 'money', 'health', 'general'];
 const YUTA_OBAA_DISCLAIMER_CATEGORIES = new Set(['money', 'health']);
@@ -406,31 +494,44 @@ async function yutaObaaClassifyMessage(userMessage) {
 
 /**
  * POST /api/yuta-obaa/chat
- * body: { email: string, message: string, history?: Array<{role, content}> }
+ * body: { message: string, history?: Array<{role, content}> }
  *
- * 有料会員限定。emailでStripeの有効な契約を確認してから応答する。
+ * ※ このエンドポイントへの入り口(index.htmlの「AI相談」ボタン)側で、
+ *   既にisPremium()による有料会員チェックを行っている前提。
+ *   なりすまし防止のためのメール確認は行わず、/api/oracleと同様に
+ *   IPベースの利用上限のみで悪用・請求暴走を防ぐ設計。
  */
 app.post('/api/yuta-obaa/chat', async (req, res) => {
   try {
-    const email = (req.body.email || '').trim();
     const message = req.body.message;
-    const history = Array.isArray(req.body.history) ? req.body.history : [];
+    const rawHistory = Array.isArray(req.body.history) ? req.body.history : [];
 
-    if (!email) {
-      return res.status(400).json({ error: 'メールアドレスが指定されていません。' });
-    }
     if (!message || typeof message !== 'string') {
       return res.status(400).json({ error: 'message is required' });
+    }
+    // メッセージ長の上限(極端な長文でAPIコストが膨らむのを防ぐ)
+    const MAX_MESSAGE_LENGTH = 2000;
+    if (message.length > MAX_MESSAGE_LENGTH) {
+      return res.status(400).json({ error: `メッセージは${MAX_MESSAGE_LENGTH}文字以内でお願いします。` });
     }
     if (!ANTHROPIC_API_KEY) {
       return res.status(500).json({ error: 'サーバー側でAPIキーが設定されていません。' });
     }
 
-    // —— 有料会員チェック(既存のStripe連携ロジックを再利用) ——
-    const isMember = await hasActiveSubscription(email);
-    if (!isMember) {
-      return res.status(403).json({
-        error: 'ユタおばーとのAIチャット相談は、有料会員様限定の機能だよ。プレミアムプランのご加入をお待ちしてるさぁ。'
+    // —— historyの検証・サニタイズ(role・contentの型/値を厳格にチェック) ——
+    // クライアントから届く値は信用せず、不正なrole(例:'system')や
+    // 文字列以外のcontentが紛れ込んでシステムプロンプトを歪めないようにする
+    const MAX_HISTORY_TURNS = 20;
+    const history = rawHistory
+      .filter((h) => h && (h.role === 'user' || h.role === 'assistant') && typeof h.content === 'string')
+      .map((h) => ({ role: h.role, content: h.content.slice(0, MAX_MESSAGE_LENGTH) }))
+      .slice(-MAX_HISTORY_TURNS);
+
+    // —— IPベースの利用上限チェック(/api/oracleと同じ仕組みを再利用) ——
+    const clientIp = (req.headers['x-forwarded-for'] || req.ip || 'unknown').split(',')[0].trim();
+    if (!isUsageAllowed(clientIp, PREMIUM_IP_LIMIT)) {
+      return res.status(429).json({
+        error: 'このネットワークからのご利用が、一定回数に達しました。しばらく時間をおいてお試しいただくか、サポートにお問い合わせください。'
       });
     }
 
